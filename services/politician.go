@@ -40,32 +40,59 @@ func parseHSWDate(raw string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
+// hswURLs lists data sources in priority order.
+// If the primary S3 bucket blocks Railway's IP, fall back to the GitHub mirror.
+var hswURLs = []string{
+	"https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json",
+	"https://raw.githubusercontent.com/AlejandroEsquivel/house-stock-watcher/master/data/all_transactions.json",
+}
+
+// fetchHSWBody tries each URL in order and returns the first valid JSON body.
+func fetchHSWBody() ([]byte, error) {
+	client := &http.Client{Timeout: 60 * time.Second}
+
+	for _, url := range hswURLs {
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 SmartMoneyTracker/1.0 research@aiedgehq.co")
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+
+		// S3 returns an HTML error page when blocking — skip it.
+		if len(body) > 0 && body[0] != '<' {
+			return body, nil
+		}
+	}
+
+	return nil, fmt.Errorf("all HSW sources unavailable")
+}
+
 // FetchPoliticianTrades pulls congressional disclosures from House Stock Watcher
 // and returns the 10 most recent trades for the given ticker within the last 12 months.
-// We use 12 months because Congress has a 45-day disclosure window, so recent trades
-// may appear with transaction dates from several months ago.
+// 12-month window is used because Congress has a 45-day disclosure delay.
 func FetchPoliticianTrades(ticker string) ([]models.PoliticianTrade, error) {
-	const url = "https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json"
-
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Get(url)
+	body, err := fetchHSWBody()
 	if err != nil {
-		return nil, fmt.Errorf("fetching politician trades: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading politician trades body: %w", err)
+		return []models.PoliticianTrade{}, nil
 	}
 
 	var transactions []hswTransaction
 	if err := json.Unmarshal(body, &transactions); err != nil {
-		return nil, fmt.Errorf("parsing politician trades JSON: %w", err)
+		return []models.PoliticianTrade{}, nil
 	}
 
-	// 12-month window — Congress has 45-day disclosure delay so recent trades
-	// often show transaction dates from months prior.
 	cutoff := time.Now().AddDate(-1, 0, 0)
 	upperTicker := strings.ToUpper(ticker)
 
@@ -98,7 +125,7 @@ func FetchPoliticianTrades(ticker string) ([]models.PoliticianTrade, error) {
 		})
 	}
 
-	// Sort most recent first (simple insertion — list is small after filtering).
+	// Sort most recent first.
 	for i := 1; i < len(found); i++ {
 		for j := i; j > 0 && found[j].date.After(found[j-1].date); j-- {
 			found[j], found[j-1] = found[j-1], found[j]
@@ -111,6 +138,10 @@ func FetchPoliticianTrades(ticker string) ([]models.PoliticianTrade, error) {
 			break
 		}
 		trades = append(trades, d.trade)
+	}
+
+	if trades == nil {
+		trades = []models.PoliticianTrade{}
 	}
 
 	return trades, nil
