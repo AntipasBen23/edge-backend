@@ -84,7 +84,21 @@ func Analyze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Ensure nil slices marshal as [] not null in JSON.
+	if politicianTrades == nil {
+		politicianTrades = []models.PoliticianTrade{}
+	}
+	if insiderTrades == nil {
+		insiderTrades = []models.InsiderTrade{}
+	}
+	if synthesis.DataGaps == nil {
+		synthesis.DataGaps = []string{}
+	}
+
 	allGaps := append(extraGaps, synthesis.DataGaps...)
+	if allGaps == nil {
+		allGaps = []string{}
+	}
 
 	prefix := req.Ticker
 	if len(prefix) > 2 {
