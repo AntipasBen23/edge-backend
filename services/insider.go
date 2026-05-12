@@ -30,13 +30,14 @@ type edgarSearchResult struct {
 }
 
 // FetchInsiderTrades queries SEC EDGAR full-text search for Form 4 filings
-// mentioning the given ticker over the last 30 days.
+// mentioning the given ticker over the last 90 days.
 func FetchInsiderTrades(ticker string) ([]models.InsiderTrade, error) {
 	endDate := time.Now().Format("2006-01-02")
-	startDate := time.Now().AddDate(0, 0, -30).Format("2006-01-02")
+	// 90-day window: insider filings can be delayed and sparse over 30 days
+	startDate := time.Now().AddDate(0, -3, 0).Format("2006-01-02")
 
 	url := fmt.Sprintf(
-		"https://efts.sec.gov/LATEST/search-index?q=%%22%s%%22&dateRange=custom&startdt=%s&enddt=%s&forms=4",
+		"https://efts.sec.gov/LATEST/search-index?q=%%22%s%%22&forms=4&dateRange=custom&startdt=%s&enddt=%s",
 		strings.ToUpper(ticker), startDate, endDate,
 	)
 
@@ -62,7 +63,8 @@ func FetchInsiderTrades(ticker string) ([]models.InsiderTrade, error) {
 
 	var result edgarSearchResult
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("parsing insider trades JSON: %w", err)
+		// EDGAR sometimes returns HTML error pages — treat as no data rather than hard fail.
+		return []models.InsiderTrade{}, nil
 	}
 
 	var trades []models.InsiderTrade
@@ -85,17 +87,22 @@ func FetchInsiderTrades(ticker string) ([]models.InsiderTrade, error) {
 		}
 		seen[key] = true
 
+		action := "FORM 4 FILED"
+		if hit.Source.FormType == "4/A" {
+			action = "FORM 4/A AMENDED"
+		}
+
 		trades = append(trades, models.InsiderTrade{
 			Name:      name,
 			Role:      role,
-			Action:    "FORM 4 FILED",
+			Action:    action,
 			Amount:    "See SEC filing",
 			FiledDate: hit.Source.FileDate,
 		})
-	}
 
-	if len(trades) > 10 {
-		trades = trades[:10]
+		if len(trades) >= 10 {
+			break
+		}
 	}
 
 	return trades, nil
