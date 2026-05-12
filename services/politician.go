@@ -47,7 +47,7 @@ func parseHSWDate(raw string) (time.Time, bool) {
 func FetchPoliticianTrades(ticker string) ([]models.PoliticianTrade, error) {
 	const url = "https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json"
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("fetching politician trades: %w", err)
