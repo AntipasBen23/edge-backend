@@ -13,17 +13,16 @@ import (
 	"smart-money-backend/models"
 )
 
-var hswDateFormats = []string{
+var politicianDateFormats = []string{
 	"2006-01-02",
 	"01/02/2006",
 	"1/2/2006",
-	"2006-01-02T15:04:05Z",
 	"January 2, 2006",
 }
 
-func parseHSWDate(raw string) (time.Time, bool) {
+func parsePoliticianDate(raw string) (time.Time, bool) {
 	raw = strings.TrimSpace(raw)
-	for _, layout := range hswDateFormats {
+	for _, layout := range politicianDateFormats {
 		if t, err := time.Parse(layout, raw); err == nil {
 			return t, true
 		}
@@ -31,129 +30,153 @@ func parseHSWDate(raw string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// quiverTrade maps the Quiver Quantitative congressional trading response.
-type quiverTrade struct {
-	Date           string  `json:"Date"`
-	Ticker         string  `json:"Ticker"`
-	Representative string  `json:"Representative"`
-	Transaction    string  `json:"Transaction"`
-	Amount         string  `json:"Amount"`
-	House          string  `json:"House"`
-	Party          string  `json:"Party"`
-	Range          *string `json:"Range"`
+// FMP house disclosure response shape.
+type fmpHouseTrade struct {
+	DisclosureDate  string `json:"disclosureDate"`
+	TransactionDate string `json:"transactionDate"`
+	Representative  string `json:"representative"`
+	Ticker          string `json:"ticker"`
+	TransactionType string `json:"transactionType"`
+	Amount          string `json:"amount"`
+	District        string `json:"district"`
 }
 
-// FetchPoliticianTrades fetches congressional trade disclosures via Quiver Quantitative.
-// Falls back to a graceful empty response if the API key is not configured.
-func FetchPoliticianTrades(ticker string) ([]models.PoliticianTrade, error) {
-	apiKey := os.Getenv("QUIVER_API_KEY")
-	if apiKey == "" {
-		log.Printf("[politician] QUIVER_API_KEY not set — skipping politician trades")
-		return []models.PoliticianTrade{}, nil
-	}
+// FMP senate trading response shape.
+type fmpSenateTrade struct {
+	DateRecieved    string `json:"dateRecieved"`
+	TransactionDate string `json:"transactionDate"`
+	Owner           string `json:"owner"`
+	Ticker          string `json:"ticker"`
+	Amount          string `json:"amount"`
+	Type            string `json:"type"`
+	Comment         string `json:"comment"`
+}
 
-	url := fmt.Sprintf("https://api.quiverquant.com/beta/historical/congresstrading/%s", strings.ToUpper(ticker))
-
+func fmpGET(url string) ([]byte, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return []models.PoliticianTrade{}, nil
+		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "SmartMoneyTracker/1.0 research@aiedgehq.co")
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("[politician] quiver request error: %v", err)
-		return []models.PoliticianTrade{}, nil
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return []models.PoliticianTrade{}, nil
-	}
-
-	log.Printf("[politician] quiver GET %s → status=%d", url, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	log.Printf("[politician] GET %s → status=%d", url, resp.StatusCode)
 
 	if resp.StatusCode != 200 {
-		log.Printf("[politician] quiver error body: %s", snippet(body))
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return body, nil
+}
+
+// FetchPoliticianTrades fetches House + Senate congressional disclosures via FMP API.
+func FetchPoliticianTrades(ticker string) ([]models.PoliticianTrade, error) {
+	apiKey := os.Getenv("FMP_API_KEY")
+	if apiKey == "" {
+		log.Printf("[politician] FMP_API_KEY not set — skipping politician trades")
 		return []models.PoliticianTrade{}, nil
 	}
 
-	var raw []quiverTrade
-	if err := json.Unmarshal(body, &raw); err != nil {
-		log.Printf("[politician] quiver parse error: %v", err)
-		return []models.PoliticianTrade{}, nil
-	}
-
-	// Filter to last 12 months and sort most-recent-first.
+	upperTicker := strings.ToUpper(strings.TrimSpace(ticker))
 	cutoff := time.Now().AddDate(-1, 0, 0)
 
-	type dated struct {
-		trade models.PoliticianTrade
-		date  time.Time
-	}
-	var found []dated
-
-	for _, t := range raw {
-		d, ok := parseHSWDate(t.Date)
-		if !ok || d.Before(cutoff) {
-			continue
-		}
-
-		amount := t.Amount
-		if amount == "" && t.Range != nil {
-			amount = *t.Range
-		}
-
-		chamber := t.House
-		if chamber == "" {
-			chamber = "Congress"
-		}
-
-		found = append(found, dated{
-			trade: models.PoliticianTrade{
-				Name:      shortenName(t.Representative),
-				Role:      chamber,
-				Party:     abbreviateParty(t.Party),
-				Action:    strings.ToUpper(t.Transaction),
-				Amount:    amount,
-				FiledDate: t.Date,
-			},
-			date: d,
-		})
-	}
-
-	// Insertion sort: most recent first.
-	for i := 1; i < len(found); i++ {
-		for j := i; j > 0 && found[j].date.After(found[j-1].date); j-- {
-			found[j], found[j-1] = found[j-1], found[j]
-		}
-	}
-
 	var trades []models.PoliticianTrade
-	for i, d := range found {
-		if i >= 10 {
-			break
+
+	// --- House disclosures ---
+	houseURL := fmt.Sprintf(
+		"https://financialmodelingprep.com/api/v4/house-disclosure?symbol=%s&apikey=%s",
+		upperTicker, apiKey,
+	)
+	if body, err := fmpGET(houseURL); err == nil {
+		var rows []fmpHouseTrade
+		if json.Unmarshal(body, &rows) == nil {
+			for _, r := range rows {
+				dateStr := r.TransactionDate
+				if dateStr == "" {
+					dateStr = r.DisclosureDate
+				}
+				d, ok := parsePoliticianDate(dateStr)
+				if !ok || d.Before(cutoff) {
+					continue
+				}
+				trades = append(trades, models.PoliticianTrade{
+					Name:      shortenName(r.Representative),
+					Role:      "House",
+					Party:     "",
+					Action:    strings.ToUpper(r.TransactionType),
+					Amount:    r.Amount,
+					FiledDate: dateStr,
+				})
+			}
+		} else {
+			log.Printf("[politician] house parse error for %s", upperTicker)
 		}
-		trades = append(trades, d.trade)
+	} else {
+		log.Printf("[politician] house fetch error: %v", err)
 	}
 
+	// --- Senate trades ---
+	senateURL := fmt.Sprintf(
+		"https://financialmodelingprep.com/api/v4/senate-trading?symbol=%s&apikey=%s",
+		upperTicker, apiKey,
+	)
+	if body, err := fmpGET(senateURL); err == nil {
+		var rows []fmpSenateTrade
+		if json.Unmarshal(body, &rows) == nil {
+			for _, r := range rows {
+				dateStr := r.TransactionDate
+				if dateStr == "" {
+					dateStr = r.DateRecieved
+				}
+				d, ok := parsePoliticianDate(dateStr)
+				if !ok || d.Before(cutoff) {
+					continue
+				}
+				trades = append(trades, models.PoliticianTrade{
+					Name:      shortenName(r.Owner),
+					Role:      "Senate",
+					Party:     "",
+					Action:    strings.ToUpper(r.Type),
+					Amount:    r.Amount,
+					FiledDate: dateStr,
+				})
+			}
+		} else {
+			log.Printf("[politician] senate parse error for %s", upperTicker)
+		}
+	} else {
+		log.Printf("[politician] senate fetch error: %v", err)
+	}
+
+	// Sort most-recent-first.
+	for i := 1; i < len(trades); i++ {
+		for j := i; j > 0; j-- {
+			di, _ := parsePoliticianDate(trades[j].FiledDate)
+			dj, _ := parsePoliticianDate(trades[j-1].FiledDate)
+			if di.After(dj) {
+				trades[j], trades[j-1] = trades[j-1], trades[j]
+			} else {
+				break
+			}
+		}
+	}
+
+	if len(trades) > 10 {
+		trades = trades[:10]
+	}
 	if trades == nil {
 		trades = []models.PoliticianTrade{}
 	}
 
-	log.Printf("[politician] %s → %d trades after filtering", ticker, len(trades))
+	log.Printf("[politician] %s → %d trades (house+senate)", upperTicker, len(trades))
 	return trades, nil
-}
-
-func snippet(b []byte) string {
-	if len(b) > 150 {
-		return string(b[:150])
-	}
-	return string(b)
 }
 
 func shortenName(name string) string {
